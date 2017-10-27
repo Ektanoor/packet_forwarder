@@ -1460,6 +1460,11 @@ void thread_up(void) {
     struct lgw_pkt_rx_s *p; /* pointer on a RX packet */
     int nb_pkt;
 
+    /* local timestamp variables until we get accurate GPS time */
+    struct timespec fetch_time;
+    struct tm * x1;
+    char fetch_timestamp[28]; /* timestamp as a text string */
+
     /* local copy of GPS time reference */
     bool ref_ok = false; /* determine if GPS time reference must be used or not */
     struct tref local_ref; /* time reference used for UTC <-> timestamp conversion */
@@ -1533,6 +1538,11 @@ void thread_up(void) {
         } else {
             ref_ok = false;
         }
+
+        /* local timestamp generation until we get accurate GPS time */
+        clock_gettime(CLOCK_REALTIME, &fetch_time);
+        x1 = gmtime(&(fetch_time.tv_sec)); /* split the UNIX timestamp to its calendar components */
+        snprintf(fetch_timestamp, sizeof fetch_timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%06liZ", (x1->tm_year)+1900, (x1->tm_mon)+1, x1->tm_mday, x1->tm_hour, x1->tm_min, x1->tm_sec, (fetch_time.tv_nsec)/1000); /* ISO 8601 format
 
         /* start composing datagram with the header */
         token_h = (uint8_t)rand(); /* random token */
@@ -1643,6 +1653,10 @@ void thread_up(void) {
                         exit(EXIT_FAILURE);
                     }
                 }
+            } else {
+               memcpy((void *)(buff_up + buff_index), (void *)",\"time\":\"???????????????????????????\"", 37);
+               memcpy((void *)(buff_up + buff_index + 9), (void *)fetch_timestamp, 27);
+               buff_index += 37;
             }
 
             /* Packet concentrator channel, RF chain & RX frequency, 34-36 useful chars */
