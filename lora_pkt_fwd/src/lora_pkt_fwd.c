@@ -71,6 +71,8 @@ Maintainer: Michael Coracin
   #define VERSION_STRING "undefined"
 #endif
 
+#define MAX_SERVERS		    4 /* Support up to 4 servers, more does not seem realistic */
+
 #define DEFAULT_SERVER      127.0.0.1   /* hostname also supported */
 #define DEFAULT_PORT_UP     1780
 #define DEFAULT_PORT_DW     1782
@@ -128,10 +130,12 @@ static bool fwd_error_pkt = false; /* packets with PAYLOAD CRC ERROR are NOT for
 static bool fwd_nocrc_pkt = false; /* packets with NO PAYLOAD CRC are NOT forwarded */
 
 /* network configuration variables */
+static uint8_t serv_count = 0; /* Counter for defined servers */
 static uint64_t lgwm = 0; /* Lora gateway MAC address */
-static char serv_addr[64] = STR(DEFAULT_SERVER); /* address of the server (host name or IPv4/IPv6) */
-static char serv_port_up[8] = STR(DEFAULT_PORT_UP); /* server port for upstream traffic */
-static char serv_port_down[8] = STR(DEFAULT_PORT_DW); /* server port for downstream traffic */
+static char serv_addr[MAX_SERVERS][64]; /* addresses of the server (host name or IPv4/IPv6) */
+static char serv_port_up[MAX_SERVERS][8]; /* servers port for upstream traffic */
+static char serv_port_down[MAX_SERVERS][8]; /* servers port for downstream traffic */
+static bool serv_live[MAX_SERVERS]; /* Register if the server could be defined. */
 static int keepalive_time = DEFAULT_KEEPALIVE; /* send a PULL_DATA request every X seconds, negative = disabled */
 
 /* statistics collection configuration variables */
@@ -142,8 +146,8 @@ static uint32_t net_mac_h; /* Most Significant Nibble, network order */
 static uint32_t net_mac_l; /* Least Significant Nibble, network order */
 
 /* network sockets */
-static int sock_up; /* socket for upstream traffic */
-static int sock_down; /* socket for downstream traffic */
+static int sock_up[MAX_SERVERS]; /* sockets for upstream traffic */
+static int sock_down[MAX_SERVERS]; /* sockets for downstream traffic */
 
 /* network protocol variables */
 static struct timeval push_timeout_half = {0, (PUSH_TIMEOUT_MS * 500)}; /* cut in half, critical for throughput */
@@ -252,7 +256,7 @@ static void gps_process_coords(void);
 
 /* threads */
 void thread_up(void);
-void thread_down(void);
+void thread_down(void* pic);
 void thread_gps(void);
 void thread_valid(void);
 void thread_jit(void);
@@ -663,8 +667,13 @@ static int parse_gateway_configuration(const char * conf_file) {
     JSON_Value *root_val;
     JSON_Object *conf_obj = NULL;
     JSON_Value *val = NULL; /* needed to detect the absence of some fields */
+    JSON_Value *val1 = NULL; /* needed to detect the absence of some fields */
+    JSON_Value *val2 = NULL; /* needed to detect the absence of some fields */
+    JSON_Array *servers = NULL;
     const char *str; /* pointer to sub-strings in the JSON data */
     unsigned long long ull = 0;
+    int i; /* Loop variable */
+    int ic; /* Server counter */
 
     /* try to parse JSON */
     root_val = json_parse_file_with_comments(conf_file);
@@ -690,25 +699,91 @@ static int parse_gateway_configuration(const char * conf_file) {
         MSG("INFO: gateway MAC address is configured to %016llX\n", ull);
     }
 
-    /* server hostname or IP address (optional) */
-    str = json_object_get_string(conf_obj, "server_address");
-    if (str != NULL) {
-        strncpy(serv_addr, str, sizeof serv_addr);
-        MSG("INFO: server hostname or IP address is configured to \"%s\"\n", serv_addr);
-    }
+	/* Obtain multiple servers hostnames and ports from array */
+	JSON_Object *nw_server = NULL;
+	servers = json_object_get_array(conf_obj, "servers");
+	if (servers != NULL) {
+		/* serv_count represents the maximal number of servers to be read. */
+		serv_count = json_array_get_count(servers);
+		MSG("INFO: Found %i servers in array.\n", serv_count);
+		ic = 0;
+		for (i = 0; i < serv_count  && ic < MAX_SERVERS; i++) {
+			nw_server = json_array_get_object(servers,i);
+			str = json_object_get_string(nw_server, "server_address");
+			val = json_object_get_value(nw_server, "serv_enabled");
+			val1 = json_object_get_value(nw_server, "serv_port_up");
+			val2 = json_object_get_value(nw_server, "serv_port_down");
+			/* Try to read the fields */
+			if (str != NULL)  strncpy(serv_addr[ic], str, sizeof serv_addr[ic]);
+			if (val1 != NULL) snprintf(serv_port_up[ic], sizeof serv_port_up[ic], "%u", (uint16_t)json_value_get_number(val1));
+			if (val2 != NULL) snprintf(serv_port_down[ic], sizeof serv_port_down[ic], "%u", (uint16_t)json_value_get_number(val2));
+			/* If there is no server name we can only silently progress to the next entry */
+			if (str == NULL) {
+				continue;
+			}
+			/* If there are no ports report and progress to the next entry */
+			else if ((val1 == NULL) || (val2 == NULL)) {
+				MSG("INFO: Skipping server \"%s\" with at least one invalid port number\n", serv_addr[ic]);
+				continue;
+			}
+            /* If the server was explicitly disabled, report and progress to the next entry */
+			else if ( (val != NULL) && ((json_value_get_type(val)) == JSONBoolean) && ((bool)json_value_get_boolean(val) == false )) {
+				MSG("INFO: Skipping disabled server \"%s\"\n", serv_addr[ic]);
+				continue;
+			}
+			/* All test survived, this is a valid server, report and increase server counter. */
+			MSG("INFO: Server %i configured to \"%s\", with port up \"%s\" and port down \"%s\"\n", ic, serv_addr[ic],serv_port_up[ic],serv_port_down[ic]);
+			/* The server may be valid, it is not yet live. */
+			serv_live[ic] = false;
+			ic++;
+		}
+		serv_count = ic;
+	} else {
+		/* If there are no servers in server array fall back to old fashioned single server definition.
+		 * The difference with the original situation is that we require a complete definition. */
+                /* server hostname or IP address (optional) */
+                str = json_object_get_string(conf_obj, "server_address");
+		val1 = json_object_get_value(conf_obj, "serv_port_up");
+		val2 = json_object_get_value(conf_obj, "serv_port_down");
+		if ((str != NULL) && (val1 != NULL) && (val2 != NULL)) {
+			serv_count = 1;
+			serv_live[0] = false;
+			strncpy(serv_addr[0], str, sizeof serv_addr[0]);
+			snprintf(serv_port_up[0], sizeof serv_port_up[0], "%u", (uint16_t)json_value_get_number(val1));
+			snprintf(serv_port_down[0], sizeof serv_port_down[0], "%u", (uint16_t)json_value_get_number(val2));
+			MSG("INFO: Server configured to \"%s\", with port up \"%s\" and port down \"%s\"\n", serv_addr[0],serv_port_up[0],serv_port_down[0]);
+		}
+	}
 
-    /* get up and down ports (optional) */
-    val = json_object_get_value(conf_obj, "serv_port_up");
-    if (val != NULL) {
-        snprintf(serv_port_up, sizeof serv_port_up, "%u", (uint16_t)json_value_get_number(val));
-        MSG("INFO: upstream port is configured to \"%s\"\n", serv_port_up);
-    }
-    val = json_object_get_value(conf_obj, "serv_port_down");
-    if (val != NULL) {
-        snprintf(serv_port_down, sizeof serv_port_down, "%u", (uint16_t)json_value_get_number(val));
-        MSG("INFO: downstream port is configured to \"%s\"\n", serv_port_down);
-    }
+	/* Using the defaults in case no values are present in the JSON */
+	//TODO: Eliminate this default behavior, the server should be well configured or stop.
+    if (serv_count == 0) {
+	MSG("INFO: Using defaults for server and ports (specific ports are ignored if no server is defined)");
+	strncpy(serv_addr[0],STR(DEFAULT_SERVER),sizeof(STR(DEFAULT_SERVER)));
+	strncpy(serv_port_up[0],STR(DEFAULT_PORT_UP),sizeof(STR(DEFAULT_PORT_UP)));
+	strncpy(serv_port_down[0],STR(DEFAULT_PORT_DW),sizeof(STR(DEFAULT_PORT_DW)));
+	serv_live[0] = false;
+	serv_count = 1;
 
+	 /* server hostname or IP address (optional) */
+	str = json_object_get_string(conf_obj, "server_address");
+	if (str != NULL) {
+	    strncpy(serv_addr[0], str, sizeof serv_addr);
+	    MSG("INFO: server hostname or IP address is configured to \"%s\"\n", serv_addr[0]);
+	}
+
+	/* get up and down ports (optional) */
+	val = json_object_get_value(conf_obj, "serv_port_up");
+	if (val != NULL) {
+	    snprintf(serv_port_up[0], sizeof serv_port_up[0], "%u", (uint16_t)json_value_get_number(val));
+	    MSG("INFO: upstream port is configured to \"%s\"\n", serv_port_up[0]);
+	}
+	val = json_object_get_value(conf_obj, "serv_port_down");
+	if (val != NULL) {
+	    snprintf(serv_port_down[0], sizeof serv_port_down[0], "%u", (uint16_t)json_value_get_number(val));
+	    MSG("INFO: downstream port is configured to \"%s\"\n", serv_port_down[0]);
+	}
+    }
     /* get keep-alive interval (in seconds) for downstream (optional) */
     val = json_object_get_value(conf_obj, "keepalive_interval");
     if (val != NULL) {
@@ -887,6 +962,8 @@ static double difftimespec(struct timespec end, struct timespec beginning) {
 static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error) {
     uint8_t buff_ack[64]; /* buffer to give feedback to server */
     int buff_index;
+    int i; /* loop variable and temporary variable for return value */
+    int ic; /* Server loop variable */
 
     /* reset buffer */
     memset(&buff_ack, 0, sizeof buff_ack);
@@ -967,7 +1044,12 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error)
     buff_ack[buff_index] = 0; /* add string terminator, for safety */
 
     /* send datagram to server */
-    return send(sock_down, (void *)buff_ack, buff_index, 0);
+    /* Loop through all possible servers */
+    for (ic = 0; ic < serv_count; ic++) {
+	i=send(sock_down[ic], (void *)buff_ack, buff_index, 0);
+	if (i==-1) { return -1; }
+    }
+    return 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -977,6 +1059,7 @@ int main(void)
 {
     struct sigaction sigact; /* SIGQUIT&SIGINT&SIGTERM signal handling */
     int i; /* loop variable and temporary variable for return value */
+    int ic; /* Server loop variable */
     int x;
 
     /* configuration file related */
@@ -986,7 +1069,7 @@ int main(void)
 
     /* threads */
     pthread_t thrid_up;
-    pthread_t thrid_down;
+    pthread_t thrid_down[MAX_SERVERS];
     pthread_t thrid_gps;
     pthread_t thrid_valid;
     pthread_t thrid_jit;
@@ -1126,69 +1209,96 @@ int main(void)
     hints.ai_family = AF_INET; /* WA: Forcing IPv4 as AF_UNSPEC makes connection on localhost to fail */
     hints.ai_socktype = SOCK_DGRAM;
 
+	/* Loop through all possible servers */
+	for (ic = 0; ic < serv_count; ic++) {
+
     /* look for server address w/ upstream port */
-    i = getaddrinfo(serv_addr, serv_port_up, &hints, &result);
+		i = getaddrinfo(serv_addr[ic], serv_port_up[ic], &hints, &result);
     if (i != 0) {
-        MSG("ERROR: [up] getaddrinfo on address %s (PORT %s) returned %s\n", serv_addr, serv_port_up, gai_strerror(i));
-        exit(EXIT_FAILURE);
+			MSG("ERROR: [up] getaddrinfo on address %s (PORT %s) returned %s\n", serv_addr[ic], serv_port_up[ic], gai_strerror(i));
+			/* This is no longer a fatal error. */
+			//exit(EXIT_FAILURE);
+			continue;
     }
 
     /* try to open socket for upstream traffic */
     for (q=result; q!=NULL; q=q->ai_next) {
-        sock_up = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
-        if (sock_up == -1) continue; /* try next field */
+			sock_up[ic] = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
+			if (sock_up[ic] == -1) continue; /* try next field */
         else break; /* success, get out of loop */
     }
     if (q == NULL) {
-        MSG("ERROR: [up] failed to open socket to any of server %s addresses (port %s)\n", serv_addr, serv_port_up);
+			MSG("ERROR: [up] failed to open socket to any of server %s addresses (port %s)\n", serv_addr[ic], serv_port_up[ic]);
         i = 1;
         for (q=result; q!=NULL; q=q->ai_next) {
             getnameinfo(q->ai_addr, q->ai_addrlen, host_name, sizeof host_name, port_name, sizeof port_name, NI_NUMERICHOST);
             MSG("INFO: [up] result %i host:%s service:%s\n", i, host_name, port_name);
             ++i;
         }
-        exit(EXIT_FAILURE);
+			/* This is no longer a fatal error. */
+			//exit(EXIT_FAILURE);
+			continue;
     }
 
     /* connect so we can send/receive packet with the server only */
-    i = connect(sock_up, q->ai_addr, q->ai_addrlen);
+		i = connect(sock_up[ic], q->ai_addr, q->ai_addrlen);
     if (i != 0) {
-        MSG("ERROR: [up] connect returned %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
+			MSG("ERROR: [up] connect on address %s (port %s) returned: %s\n", serv_addr[ic], serv_port_down[ic], strerror(errno));
+			/* This is no longer a fatal error. */
+			//exit(EXIT_FAILURE);
+			continue;
     }
     freeaddrinfo(result);
 
     /* look for server address w/ downstream port */
-    i = getaddrinfo(serv_addr, serv_port_down, &hints, &result);
+		i = getaddrinfo(serv_addr[ic], serv_port_down[ic], &hints, &result);
     if (i != 0) {
-        MSG("ERROR: [down] getaddrinfo on address %s (port %s) returned %s\n", serv_addr, serv_port_up, gai_strerror(i));
-        exit(EXIT_FAILURE);
+			MSG("ERROR: [down] getaddrinfo on address %s (port %s) returned: %s\n", serv_addr[ic], serv_port_down[ic], gai_strerror(i));
+			/* This is no longer a fatal error. */
+			//exit(EXIT_FAILURE);
+			continue;
     }
 
     /* try to open socket for downstream traffic */
     for (q=result; q!=NULL; q=q->ai_next) {
-        sock_down = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
-        if (sock_down == -1) continue; /* try next field */
+			sock_down[ic] = socket(q->ai_family, q->ai_socktype,q->ai_protocol);
+			if (sock_down[ic] == -1) continue; /* try next field */
         else break; /* success, get out of loop */
     }
     if (q == NULL) {
-        MSG("ERROR: [down] failed to open socket to any of server %s addresses (port %s)\n", serv_addr, serv_port_up);
+			MSG("ERROR: [down] failed to open socket to any of server %s addresses (port %s)\n", serv_addr[ic], serv_port_down[ic]);
         i = 1;
         for (q=result; q!=NULL; q=q->ai_next) {
             getnameinfo(q->ai_addr, q->ai_addrlen, host_name, sizeof host_name, port_name, sizeof port_name, NI_NUMERICHOST);
             MSG("INFO: [down] result %i host:%s service:%s\n", i, host_name, port_name);
             ++i;
         }
-        exit(EXIT_FAILURE);
+			/* This is no longer a fatal error. */
+			//exit(EXIT_FAILURE);
+			continue;
     }
 
     /* connect so we can send/receive packet with the server only */
-    i = connect(sock_down, q->ai_addr, q->ai_addrlen);
+		i = connect(sock_down[ic], q->ai_addr, q->ai_addrlen);
     if (i != 0) {
-        MSG("ERROR: [down] connect returned %s\n", strerror(errno));
-        exit(EXIT_FAILURE);
+			MSG("ERROR: [down] connect address %s (port %s) returned: %s\n", serv_addr[ic], serv_port_down[ic], strerror(errno));
+			/* This is no longer a fatal error. */
+			//exit(EXIT_FAILURE);
+			continue;
     }
     freeaddrinfo(result);
+
+		/* If we made it through to here, this server is live */
+		serv_live[ic] = true;
+		MSG("INFO: Successfully contacted server %s\n", serv_addr[ic]);
+	}
+
+	//TODO: Check if there are any live servers available, if not we should exit since there cannot be any
+	// sensible course of action. Actually it would be best to redesign the whole communication loop, and take
+	// the socket constructors to be inside a try-retry loop. That way we can respond to severs that implemented
+	// there UDP handling erroneously (Like TTN at this moment?), or any other temporal obstruction in the communication
+	// path (broken stacks in routers for example) Now, contact may be lost for ever and a manual
+	// restart at the this side is required.
 
     /* starting the concentrator */
     i = lgw_start();
@@ -1205,10 +1315,12 @@ int main(void)
         MSG("ERROR: [main] impossible to create upstream thread\n");
         exit(EXIT_FAILURE);
     }
-    i = pthread_create( &thrid_down, NULL, (void * (*)(void *))thread_down, NULL);
-    if (i != 0) {
-        MSG("ERROR: [main] impossible to create downstream thread\n");
-        exit(EXIT_FAILURE);
+    for (ic = 0; ic < serv_count; ic++) if (serv_live[ic] == true) {
+	i = pthread_create( &thrid_down[ic], NULL, (void * (*)(void *))thread_down, (void *) (long) ic);			
+	if (i != 0) {
+        	MSG("ERROR: [main] impossible to create downstream thread\n");
+        	exit(EXIT_FAILURE);
+	}
     }
     i = pthread_create( &thrid_jit, NULL, (void * (*)(void *))thread_jit, NULL);
     if (i != 0) {
@@ -1415,7 +1527,9 @@ int main(void)
 
     /* wait for upstream thread to finish (1 fetch cycle max) */
     pthread_join(thrid_up, NULL);
-    pthread_cancel(thrid_down); /* don't wait for downstream thread */
+    for (ic = 0; ic < serv_count; ic++) if (serv_live[ic] == true) {
+	pthread_cancel(thrid_down[ic]); /* don't wait for downstream thread */
+    }
     pthread_cancel(thrid_jit); /* don't wait for jit thread */
     pthread_cancel(thrid_timersync); /* don't wait for timer sync thread */
     if (gps_enabled == true) {
@@ -1433,8 +1547,10 @@ int main(void)
     /* if an exit signal was received, try to quit properly */
     if (exit_sig) {
         /* shut down network sockets */
-        shutdown(sock_up, SHUT_RDWR);
-        shutdown(sock_down, SHUT_RDWR);
+	for (ic = 0; ic < serv_count; ic++) if (serv_live[ic] == true) {
+		shutdown(sock_up[ic], SHUT_RDWR);
+		shutdown(sock_down[ic], SHUT_RDWR);
+	}
         /* stop the hardware */
         i = lgw_stop();
         if (i == LGW_HAL_SUCCESS) {
@@ -1453,6 +1569,7 @@ int main(void)
 
 void thread_up(void) {
     int i, j; /* loop variables */
+    int ic; /* Server Loop Variable */
     unsigned pkt_in_dgram; /* nb on Lora packet in the current datagram */
 
     /* allocate memory for packet fetching and processing */
@@ -1496,10 +1613,12 @@ void thread_up(void) {
     uint16_t mote_fcnt = 0;
 
     /* set upstream socket RX timeout */
-    i = setsockopt(sock_up, SOL_SOCKET, SO_RCVTIMEO, (void *)&push_timeout_half, sizeof push_timeout_half);
+	for (ic = 0; ic < serv_count; ic++) if (serv_live[ic] == true) {
+		i = setsockopt(sock_up[ic], SOL_SOCKET, SO_RCVTIMEO, (void *)&push_timeout_half, sizeof push_timeout_half);
     if (i != 0) {
-        MSG("ERROR: [up] setsockopt returned %s\n", strerror(errno));
+			MSG("ERROR: [up] setsockopt for server %s returned %s\n", serv_addr[ic], strerror(errno));
         exit(EXIT_FAILURE);
+		}
     }
 
     /* pre-fill the data buffer with fixed fields */
@@ -1869,8 +1988,11 @@ void thread_up(void) {
 
         printf("\nJSON up: %s\n", (char *)(buff_up + 12)); /* DEBUG: display JSON payload */
 
-        /* send datagram to server */
-        send(sock_up, (void *)buff_up, buff_index, 0);
+		/* send datagram to servers sequentially */
+		// TODO make this parallel.
+		for (ic = 0; ic < serv_count; ic++) if (serv_live[ic] == true) {
+
+			send(sock_up[ic], (void *)buff_up, buff_index, 0);
         clock_gettime(CLOCK_MONOTONIC, &send_time);
         pthread_mutex_lock(&mx_meas_up);
         meas_up_dgram_sent += 1;
@@ -1878,7 +2000,7 @@ void thread_up(void) {
 
         /* wait for acknowledge (in 2 times, to catch extra packets) */
         for (i=0; i<2; ++i) {
-            j = recv(sock_up, (void *)buff_ack, sizeof buff_ack, 0);
+				j = recv(sock_up[ic], (void *)buff_ack, sizeof buff_ack, 0);
             clock_gettime(CLOCK_MONOTONIC, &recv_time);
             if (j == -1) {
                 if (errno == EAGAIN) { /* timeout */
@@ -1893,12 +2015,14 @@ void thread_up(void) {
                 //MSG("WARNING: [up] ignored out-of sync ACK packet\n");
                 continue;
             } else {
-                MSG("INFO: [up] PUSH_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
+					//TODO: This may generate a lot of logdata, see other todo for a solution.
+					MSG("INFO: [up] PUSH_ACK for server %s received in %i ms\n", serv_addr[ic], (int)(1000 * difftimespec(recv_time, send_time)));
                 meas_up_ack_rcv += 1;
                 break;
             }
         }
         pthread_mutex_unlock(&mx_meas_up);
+		}
     }
     MSG("\nINFO: End of upstream thread\n");
 }
@@ -1906,8 +2030,11 @@ void thread_up(void) {
 /* -------------------------------------------------------------------------- */
 /* --- THREAD 2: POLLING SERVER AND ENQUEUING PACKETS IN JIT QUEUE ---------- */
 
-void thread_down(void) {
+// TODO: factor this out and inspect the use of global variables. (Cause this is started for each server)
+
+void thread_down(void* pic) {
     int i; /* loop variables */
+	int ic = (int) (long) pic;
 
     /* configuration and metadata for an outbound packet */
     struct lgw_pkt_tx_s txpkt;
@@ -1966,10 +2093,13 @@ void thread_down(void) {
     enum jit_error_e jit_result = JIT_ERROR_OK;
     enum jit_pkt_type_e downlink_type;
 
+    MSG("INFO: [down] Thread activated for all server %s\n",serv_addr[ic]);
+
     /* set downstream socket RX timeout */
-    i = setsockopt(sock_down, SOL_SOCKET, SO_RCVTIMEO, (void *)&pull_timeout, sizeof pull_timeout);
+	i = setsockopt(sock_down[ic], SOL_SOCKET, SO_RCVTIMEO, (void *)&pull_timeout, sizeof pull_timeout);
     if (i != 0) {
-        MSG("ERROR: [down] setsockopt returned %s\n", strerror(errno));
+		//TODO Should this failure bring the application down?
+		MSG("ERROR: [down] setsockopt for server %s returned %s\n", serv_addr[ic], strerror(errno));
         exit(EXIT_FAILURE);
     }
 
@@ -2083,7 +2213,7 @@ void thread_down(void) {
         /* auto-quit if the threshold is crossed */
         if ((autoquit_threshold > 0) && (autoquit_cnt >= autoquit_threshold)) {
             exit_sig = true;
-            MSG("INFO: [down] the last %u PULL_DATA were not ACKed, exiting application\n", autoquit_threshold);
+			MSG("INFO: [down] for server %s the last %u PULL_DATA were not ACKed, exiting application\n", serv_addr[ic], autoquit_threshold);
             break;
         }
 
@@ -2094,7 +2224,7 @@ void thread_down(void) {
         buff_req[2] = token_l;
 
         /* send PULL request and record time */
-        send(sock_down, (void *)buff_req, sizeof buff_req, 0);
+		send(sock_down[ic], (void *)buff_req, sizeof buff_req, 0);
         clock_gettime(CLOCK_MONOTONIC, &send_time);
         pthread_mutex_lock(&mx_meas_dw);
         meas_dw_pull_sent += 1;
@@ -2107,7 +2237,7 @@ void thread_down(void) {
         while ((int)difftimespec(recv_time, send_time) < keepalive_time) {
 
             /* try to receive a datagram */
-            msg_len = recv(sock_down, (void *)buff_down, (sizeof buff_down)-1, 0);
+			msg_len = recv(sock_down[ic], (void *)buff_down, (sizeof buff_down)-1, 0);
             clock_gettime(CLOCK_MONOTONIC, &recv_time);
 
             /* Pre-allocate beacon slots in JiT queue, to check downlink collisions */
@@ -2231,24 +2361,26 @@ void thread_down(void) {
             if (buff_down[3] == PKT_PULL_ACK) {
                 if ((buff_down[1] == token_h) && (buff_down[2] == token_l)) {
                     if (req_ack) {
-                        MSG("INFO: [down] duplicate ACK received :)\n");
+						MSG("INFO: [down] for server %s duplicate ACK received :)\n",serv_addr[ic]);
                     } else { /* if that packet was not already acknowledged */
                         req_ack = true;
                         autoquit_cnt = 0;
                         pthread_mutex_lock(&mx_meas_dw);
                         meas_dw_ack_rcv += 1;
                         pthread_mutex_unlock(&mx_meas_dw);
-                        MSG("INFO: [down] PULL_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
+						MSG("INFO: [down] for server %s PULL_ACK received in %i ms\n", serv_addr[ic], (int)(1000 * difftimespec(recv_time, send_time)));
                     }
                 } else { /* out-of-sync token */
-                    MSG("INFO: [down] received out-of-sync ACK\n");
+					MSG("INFO: [down] for server %s, received out-of-sync ACK\n",serv_addr[ic]);
                 }
                 continue;
             }
 
+
+			//TODO: This might generate to much logging data. The reporting should be reevaluated and an option -q should be added.
             /* the datagram is a PULL_RESP */
             buff_down[msg_len] = 0; /* add string terminator, just to be safe */
-            MSG("INFO: [down] PULL_RESP received  - token[%d:%d] :)\n", buff_down[1], buff_down[2]); /* very verbose */
+            MSG("INFO: [down] for server %s PULL_RESP received  - token[%d:%d] :)\n",serv_addr[ic], buff_down[1], buff_down[2]); /* very verbose */
             printf("\nJSON down: %s\n", (char *)(buff_down + 4)); /* DEBUG: display JSON payload */
 
             /* initialize TX struct and try to parse JSON */
